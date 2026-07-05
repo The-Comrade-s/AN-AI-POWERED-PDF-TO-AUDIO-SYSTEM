@@ -1,222 +1,197 @@
 """
-My Library page: displays uploaded PDFs as cards with actions to convert to
-audio, play, download, or delete. Also handles the voice/speed selection
-modal-like flow for conversion.
+PDF processing utilities: text extraction, cleaning, chapter/heading detection,
+thumbnail generation, and estimated listening time.
 """
 import os
+import re
+import json
 
-import streamlit as st
+import fitz  # PyMuPDF
 
-from database.models import get_session, PDFDocument, AudioFile
-from pdf_processor.processor import (
-    extract_text_by_page, chapters_from_json, split_text_by_chapters, get_full_text,
+
+def extract_text_by_page(pdf_path: str) -> list[str]:
+    """Return a list of raw text strings, one per page."""
+    pages = []
+    with fitz.open(pdf_path) as doc:
+        for page in doc:
+            pages.append(page.get_text("text"))
+    return pages
+
+
+def clean_text(text: str) -> str:
+    """Remove broken characters, excess whitespace, and unreadable symbols."""
+    if not text:
+        return ""
+    # Remove control characters / unreadable symbols
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+    # Collapse multiple blank lines
+    text = re.sub(r"\n\s*\n+", "\n\n", text)
+    # Collapse excess spaces
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    # Fix hyphenated line-break words e.g. "inter-\nnet" -> "internet"
+    text = re.sub(r"-\n(\w)", r"\1", text)
+    # Normalize remaining single newlines within a paragraph to spaces
+    text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
+    return text.strip()
+
+
+HEADING_PATTERN = re.compile(
+    r"^\s*(chapter\s+\d+|CHAPTER\s+\d+|Chapter\s+[IVXLC]+|\d{1,2}\.\s+[A-Z][^\n]{2,80}|[A-Z][A-Z\s]{6,60})\s*$",
+    re.MULTILINE,
 )
-from audio.tts_engine import generate_speech, get_duration_seconds, list_available_voices, SPEED_OPTIONS, change_speed
-from utils.helpers import format_date, format_filesize, user_audio_dir, format_duration_long
-from pdf_processor.processor import estimate_listening_seconds_from_word_count
 
 
-def render_library_page():
-    st.markdown("### My Library")
-    st.caption("All your uploaded documents in one place.")
+def detect_chapters(pages: list[str]) -> list[dict]:
+    """
+    Detect probable chapter/heading boundaries across the document.
+    Returns a list of {title, page_start} dicts. Falls back to a single
+    'Full Document' chapter if nothing is detected, or if the document is
+    too short for chapter splitting to make sense (e.g. a 1-2 page CV,
+    where ALL-CAPS section headers like "EDUCATION" would otherwise be
+    mistaken for chapter breaks).
+    """
+    if len(pages) < 3:
+        return [{"title": "Full Document", "page_start": 1}]
 
-    user_id = st.session_state["user_id"]
-    session = get_session()
+    chapters = []
+    for page_num, raw_text in enumerate(pages, start=1):
+        for match in HEADING_PATTERN.finditer(raw_text):
+            title = match.group(0).strip()
+            if 3 <= len(title) <= 80:
+                chapters.append({"title": title, "page_start": page_num})
+
+    # De-duplicate consecutive near-identical headings
+    deduped = []
+    seen_titles = set()
+    for ch in chapters:
+        key = ch["title"].lower()
+        if key not in seen_titles:
+            deduped.append(ch)
+            seen_titles.add(key)
+
+    if not deduped:
+        deduped = [{"title": "Full Document", "page_start": 1}]
+
+    return deduped
+
+
+def generate_thumbnail(pdf_path: str, output_path: str, zoom: float = 0.6) -> str | None:
+    """Render the first page of the PDF as a PNG thumbnail. Returns path or None."""
     try:
-        search_col, filter_col = st.columns([3, 1])
-        with search_col:
-            query = st.text_input("Search your library", placeholder="🔍 Search PDFs by title...", label_visibility="collapsed")
-        with filter_col:
-            sort_option = st.selectbox(
-                "Sort", ["Newest", "Oldest", "Longest", "Shortest"], label_visibility="collapsed"
-            )
-
-        pdfs_query = session.query(PDFDocument).filter(PDFDocument.user_id == user_id)
-        if query:
-            pdfs_query = pdfs_query.filter(PDFDocument.title.ilike(f"%{query}%"))
-
-        pdfs = pdfs_query.all()
-
-        if sort_option == "Newest":
-            pdfs.sort(key=lambda p: p.uploaded_at, reverse=True)
-        elif sort_option == "Oldest":
-            pdfs.sort(key=lambda p: p.uploaded_at)
-        elif sort_option == "Longest":
-            pdfs.sort(key=lambda p: p.word_count, reverse=True)
-        elif sort_option == "Shortest":
-            pdfs.sort(key=lambda p: p.word_count)
-
-        if not pdfs:
-            st.info("No PDFs found. Upload one from the **Upload PDF** page.")
-            return
-
-        for pdf in pdfs:
-            _render_pdf_card(pdf, session, user_id)
-
-    finally:
-        session.close()
+        with fitz.open(pdf_path) as doc:
+            if len(doc) == 0:
+                return None
+            page = doc[0]
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat)
+            pix.save(output_path)
+        return output_path
+    except Exception:
+        return None
 
 
-def _render_pdf_card(pdf: PDFDocument, session, user_id: int):
-    est_seconds = estimate_listening_seconds_from_word_count(pdf.word_count)
-    audio_files = session.query(AudioFile).filter(AudioFile.pdf_id == pdf.id).all()
-    has_audio = len(audio_files) > 0
-
-    with st.container():
-        st.markdown('<div class="glass-card" style="margin-bottom:14px;">', unsafe_allow_html=True)
-        cols = st.columns([1, 3, 1, 1, 1, 1])
-
-        with cols[0]:
-            if pdf.thumbnail_path and os.path.exists(pdf.thumbnail_path):
-                st.image(pdf.thumbnail_path, use_container_width=True)
-            else:
-                st.markdown(
-                    '<div style="font-size:36px; text-align:center;">📄</div>', unsafe_allow_html=True
-                )
-
-        with cols[1]:
-            st.markdown(f"**{pdf.title}**")
-            st.caption(
-                f"{pdf.page_count} pages · {format_filesize(pdf.file_size_kb)} · "
-                f"Uploaded {format_date(pdf.uploaded_at)} · ~{format_duration_long(est_seconds)} listen"
-            )
-            status_color = {"converted": "#22c55e", "processing": "#f59e0b", "uploaded": "#60a5fa", "failed": "#ef4444"}.get(pdf.status, "#a855f7")
-            st.markdown(
-                f'<span class="badge" style="background:{status_color}22;color:{status_color};">{pdf.status.title()}</span>',
-                unsafe_allow_html=True,
-            )
-
-        with cols[2]:
-            if st.button("🎙️ Convert", key=f"convert_{pdf.id}", use_container_width=True):
-                st.session_state[f"show_convert_{pdf.id}"] = True
-
-        with cols[3]:
-            if has_audio:
-                if st.button("▶️ Play", key=f"play_{pdf.id}", use_container_width=True):
-                    st.session_state["now_playing_audio_id"] = audio_files[0].id
-                    st.session_state["current_page"] = "Now Playing"
-                    st.rerun()
-            else:
-                st.button("▶️ Play", key=f"play_disabled_{pdf.id}", use_container_width=True, disabled=True)
-
-        with cols[4]:
-            if has_audio and os.path.exists(audio_files[0].file_path):
-                with open(audio_files[0].file_path, "rb") as f:
-                    st.download_button(
-                        "⬇️", f, file_name=os.path.basename(audio_files[0].file_path),
-                        key=f"dl_{pdf.id}", use_container_width=True,
-                    )
-            else:
-                st.button("⬇️", key=f"dl_disabled_{pdf.id}", use_container_width=True, disabled=True)
-
-        with cols[5]:
-            if st.button("🗑️", key=f"del_{pdf.id}", use_container_width=True):
-                _delete_pdf(pdf, session)
-                st.rerun()
-
-        if pdf.summary:
-            with st.expander("✨ AI Summary"):
-                st.write(pdf.summary)
-
-        if st.session_state.get(f"show_convert_{pdf.id}"):
-            _render_conversion_panel(pdf, session, user_id)
-
-        st.markdown("</div>", unsafe_allow_html=True)
-
-
-def _render_conversion_panel(pdf: PDFDocument, session, user_id: int):
-    st.markdown('<div class="soft-divider"></div>', unsafe_allow_html=True)
-    st.markdown("**Convert to Audio**")
-
-    voices = list_available_voices()
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        voice_label = st.selectbox("Voice", list(voices.keys()), key=f"voice_{pdf.id}")
-    with col2:
-        speed = st.selectbox("Speed", SPEED_OPTIONS, index=2, key=f"speed_{pdf.id}")
-    with col3:
-        audio_format = st.selectbox("Format", ["mp3", "wav"], key=f"format_{pdf.id}")
-
-    by_chapter = st.checkbox("Generate separate audio per chapter", key=f"chapter_{pdf.id}")
-
-    if st.button("Generate Audio", key=f"generate_{pdf.id}", use_container_width=True):
-        _generate_audio(pdf, session, user_id, voices[voice_label], speed, audio_format, by_chapter)
-
-
-def _generate_audio(pdf, session, user_id, voice, speed, audio_format, by_chapter):
-    audio_dir = user_audio_dir(user_id)
-    progress = st.progress(0, text="Preparing text...")
-
+def validate_pdf(pdf_path: str) -> tuple[bool, str]:
+    """Check the PDF opens correctly and has readable content."""
     try:
-        pages = extract_text_by_page(pdf.file_path)
-        chapters = chapters_from_json(pdf.chapters_json)
-
-        if by_chapter and len(chapters) > 1:
-            chunks = split_text_by_chapters(pages, chapters)
-        else:
-            chunks = [{"title": None, "text": get_full_text(pages)}]
-
-        total = len(chunks)
-        for idx, chunk in enumerate(chunks, start=1):
-            progress.progress(int((idx - 1) / total * 80) + 10, text=f"Generating speech ({idx}/{total})...")
-
-            base_name = f"{pdf.id}_{idx}"
-            mp3_path = generate_speech(chunk["text"], voice, audio_dir, base_filename=base_name)
-
-            final_path = mp3_path
-            if speed != 1.0 or audio_format != "mp3":
-                # Use a distinct filename so we never read and write the same
-                # file at once (pydub needs the source fully readable first).
-                final_path = os.path.join(audio_dir, f"{base_name}_final.{audio_format}")
-                change_speed(mp3_path, speed, final_path)
-                if os.path.exists(mp3_path) and mp3_path != final_path:
-                    try:
-                        os.remove(mp3_path)
-                    except OSError:
-                        pass
-
-            duration = get_duration_seconds(final_path)
-
-            audio_record = AudioFile(
-                pdf_id=pdf.id,
-                user_id=user_id,
-                voice=voice,
-                format=audio_format,
-                file_path=final_path,
-                duration_seconds=duration,
-                chapter_title=chunk["title"],
-                chapter_index=idx,
-            )
-            session.add(audio_record)
-
-        pdf.status = "converted"
-        session.commit()
-
-        progress.progress(100, text="Done!")
-        st.success("Audio generated successfully! Head to Now Playing to listen.")
-        st.session_state[f"show_convert_{pdf.id}"] = False
-
-    except RuntimeError as exc:
-        session.rollback()
-        st.error(str(exc))
+        with fitz.open(pdf_path) as doc:
+            if len(doc) == 0:
+                return False, "The PDF has no pages."
+            if doc.is_encrypted:
+                return False, "This PDF is password-protected. Please upload an unlocked file."
+        return True, "Valid PDF."
     except Exception as exc:
-        session.rollback()
-        st.error(f"Audio generation failed: {exc}")
-    finally:
-        progress.empty()
+        return False, f"Could not open PDF: it may be corrupted. ({exc})"
 
 
-def _delete_pdf(pdf: PDFDocument, session):
+def get_full_text(pages: list[str]) -> str:
+    """Join and clean all page text into one continuous string."""
+    return clean_text("\n\n".join(pages))
+
+
+def word_count(text: str) -> int:
+    return len(text.split())
+
+
+def estimate_listening_seconds(text: str, words_per_minute: int = 150) -> float:
+    """Estimate audio duration in seconds based on word count and speaking rate."""
+    wc = word_count(text)
+    minutes = wc / words_per_minute if words_per_minute else 0
+    return round(minutes * 60, 1)
+
+
+def estimate_listening_seconds_from_word_count(wc: int, words_per_minute: int = 150) -> float:
+    """Estimate audio duration in seconds directly from a known word count."""
+    minutes = wc / words_per_minute if words_per_minute else 0
+    return round(minutes * 60, 1)
+
+
+def chapters_to_json(chapters: list[dict]) -> str:
+    return json.dumps(chapters)
+
+
+def chapters_from_json(chapters_json: str) -> list[dict]:
+    if not chapters_json:
+        return []
     try:
-        if os.path.exists(pdf.file_path):
-            os.remove(pdf.file_path)
-        if pdf.thumbnail_path and os.path.exists(pdf.thumbnail_path):
-            os.remove(pdf.thumbnail_path)
-        for audio in pdf.audio_files:
-            if os.path.exists(audio.file_path):
-                os.remove(audio.file_path)
-        session.delete(pdf)
-        session.commit()
-    except Exception as exc:
-        session.rollback()
-        st.error(f"Could not delete file: {exc}")
+        return json.loads(chapters_json)
+    except json.JSONDecodeError:
+        return []
+
+
+def _looks_like_toc_or_cover(text: str) -> bool:
+    """
+    Heuristic check for table-of-contents or cover/title pages: short lines,
+    many of which look like headings themselves, with little actual prose.
+    These pages produce poor audio if converted as their own "chapter" and
+    are better skipped or merged into the surrounding content.
+    """
+    if not text:
+        return True
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if not lines:
+        return True
+    words = text.split()
+    if len(words) < 30:
+        return True
+    avg_line_len = sum(len(l.split()) for l in lines) / len(lines)
+    if avg_line_len < 4:  # lots of short, heading-like lines = likely TOC/cover
+        return True
+    if re.search(r"table\s+of\s+contents", text, re.IGNORECASE):
+        return True
+    return False
+
+
+def split_text_by_chapters(pages: list[str], chapters: list[dict]) -> list[dict]:
+    """
+    Given page texts and detected chapter start pages, split full cleaned text
+    into per-chapter text blocks. Returns [{title, text}]. Chapters whose
+    content is too short, or that look like a cover/table-of-contents page,
+    are filtered out rather than sent to text-to-speech as their own chunk.
+    """
+    if len(chapters) <= 1:
+        return [{"title": chapters[0]["title"] if chapters else "Full Document",
+                  "text": get_full_text(pages)}]
+
+    result = []
+    sorted_chapters = sorted(chapters, key=lambda c: c["page_start"])
+    for i, ch in enumerate(sorted_chapters):
+        start_page = ch["page_start"] - 1
+        end_page = sorted_chapters[i + 1]["page_start"] - 1 if i + 1 < len(sorted_chapters) else len(pages)
+        chunk_pages = pages[start_page:end_page]
+        chunk_text = get_full_text(chunk_pages)
+
+        if len(chunk_text.split()) < 30:
+            continue  # too short to be meaningful narrated content
+        if _looks_like_toc_or_cover(chunk_text):
+            continue  # cover page / table of contents, skip
+
+        # Use a clean, single-line title even if the detected heading
+        # spanned multiple lines (e.g. a crowded TOC-adjacent match)
+        clean_title = ch["title"].split("\n")[0].strip()
+        result.append({"title": clean_title, "text": chunk_text})
+
+    # If filtering removed everything, fall back to the whole document
+    if not result:
+        result = [{"title": "Full Document", "text": get_full_text(pages)}]
+
+    return result
