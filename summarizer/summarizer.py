@@ -1,13 +1,18 @@
 """
 Summarization module.
 
-Default engine: sumy (TextRank), a lightweight, pure-CPU, offline extractive
-summarizer. Chosen over Hugging Face Transformers (BART/T5) because
-transformer models require large downloads (400MB-1.5GB) and significant
-RAM, which is not reliable on free-tier hosts like Streamlit Community Cloud
-or Render's free plan (typically 512MB-1GB RAM). sumy gives fast, "good
-enough" summaries with a negligible footprint, keeping the app deployable
-out of the box.
+Default engine: a lightweight, dependency-free extractive summarizer built
+with pure Python (word-frequency scoring, no NLTK/sumy). This was chosen
+over sumy/NLTK-based summarization after real deployment testing showed
+NLTK's runtime download of tokenizer data (punkt/punkt_tab) can hang or
+fail unpredictably on Streamlit Community Cloud's network, causing the
+"Process & Convert" step to appear frozen with no visible error. A
+zero-dependency approach removes that failure point completely and runs
+instantly with no external downloads.
+
+It was also chosen over Hugging Face Transformers (BART/T5) because those
+models require large downloads (400MB-1.5GB) and significant RAM, which is
+unreliable on free-tier hosts (typically 512MB-1GB RAM).
 
 The `summarize()` function is the single entry point used by the rest of
 the app. To upgrade later:
@@ -17,46 +22,78 @@ the app. To upgrade later:
 No other file needs to change.
 """
 import os
+import re
+from collections import Counter
 
-import nltk
+# Options: "simple" (default, offline, zero-dependency), "transformers", "llm_api"
+SUMMARIZER_ENGINE = os.environ.get("SUMMARIZER_ENGINE", "simple")
 
-from sumy.parsers.plaintext import PlaintextParser
-from sumy.nlp.tokenizers import Tokenizer
-from sumy.summarizers.text_rank import TextRankSummarizer
-from sumy.nlp.stemmers import Stemmer
-from sumy.utils import get_stop_words
+_STOP_WORDS = {
+    "a", "an", "the", "and", "or", "but", "if", "then", "else", "when", "at", "by",
+    "for", "with", "about", "against", "between", "into", "through", "during",
+    "before", "after", "above", "below", "to", "from", "up", "down", "in", "out",
+    "on", "off", "over", "under", "again", "further", "once", "here", "there",
+    "all", "any", "both", "each", "few", "more", "most", "other", "some", "such",
+    "no", "nor", "not", "only", "own", "same", "so", "than", "too", "very", "s",
+    "t", "can", "will", "just", "don", "should", "now", "is", "are", "was", "were",
+    "be", "been", "being", "have", "has", "had", "having", "do", "does", "did",
+    "doing", "it", "its", "this", "that", "these", "those", "of", "as", "we",
+    "our", "you", "your", "i", "he", "she", "they", "them", "his", "her", "their",
+}
 
-
-def _ensure_nltk_data():
-    """Download NLTK tokenizer data required by sumy, if not already present."""
-    for resource in ["punkt", "punkt_tab"]:
-        try:
-            nltk.data.find(f"tokenizers/{resource}")
-        except LookupError:
-            try:
-                nltk.download(resource, quiet=True)
-            except Exception:
-                pass  # Fails gracefully; summarize() has its own fallback
-
-
-_ensure_nltk_data()
-
-# Options: "sumy" (default, offline, lightweight), "transformers", "llm_api"
-SUMMARIZER_ENGINE = os.environ.get("SUMMARIZER_ENGINE", "sumy")
-
-LANGUAGE = "english"
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9\"'])")
+_WORD_RE = re.compile(r"[A-Za-z']+")
 
 
-def _summarize_sumy(text: str, sentence_count: int = 5) -> str:
-    if not text or not text.strip():
-        return ""
-    parser = PlaintextParser.from_string(text, Tokenizer(LANGUAGE))
-    stemmer = Stemmer(LANGUAGE)
-    summarizer = TextRankSummarizer(stemmer)
-    summarizer.stop_words = get_stop_words(LANGUAGE)
+def _split_sentences(text: str) -> list:
+    """Split text into sentences using punctuation heuristics (no NLTK needed)."""
+    text = text.strip()
+    if not text:
+        return []
+    sentences = _SENTENCE_SPLIT_RE.split(text)
+    # Filter out fragments that are too short to be real sentences
+    return [s.strip() for s in sentences if len(s.strip()) > 15]
 
-    sentences = summarizer(parser.document, sentence_count)
-    return " ".join(str(s) for s in sentences)
+
+def _summarize_simple(text: str, sentence_count: int = 5) -> str:
+    """
+    Extractive summary via word-frequency scoring:
+    1. Split into sentences
+    2. Score words by frequency (excluding stop words)
+    3. Score each sentence by the sum of its word scores
+    4. Return the top N highest-scoring sentences, in original order
+    """
+    sentences = _split_sentences(text)
+    if not sentences:
+        return text[:500]
+
+    if len(sentences) <= sentence_count:
+        return " ".join(sentences)
+
+    words = [w.lower() for w in _WORD_RE.findall(text) if w.lower() not in _STOP_WORDS and len(w) > 2]
+    if not words:
+        return " ".join(sentences[:sentence_count])
+
+    word_freq = Counter(words)
+    max_freq = max(word_freq.values())
+    for w in word_freq:
+        word_freq[w] = word_freq[w] / max_freq
+
+    sentence_scores = []
+    for idx, sentence in enumerate(sentences):
+        sentence_words = [w.lower() for w in _WORD_RE.findall(sentence)]
+        if not sentence_words:
+            score = 0.0
+        else:
+            score = sum(word_freq.get(w, 0.0) for w in sentence_words) / len(sentence_words)
+        # Slight boost for earlier sentences (often contain key context)
+        position_boost = 1.15 if idx < 3 else 1.0
+        sentence_scores.append((idx, sentence, score * position_boost))
+
+    top_sentences = sorted(sentence_scores, key=lambda x: x[2], reverse=True)[:sentence_count]
+    top_sentences.sort(key=lambda x: x[0])  # restore original order
+
+    return " ".join(s[1] for s in top_sentences)
 
 
 def _summarize_transformers(text: str, sentence_count: int = 5) -> str:
@@ -82,7 +119,7 @@ def _summarize_llm_api(text: str, sentence_count: int = 5) -> str:
         response = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=300,
-            messages=[{"role": "user", "content": f"Summarize:\\n\\n{text}"}]
+            messages=[{"role": "user", "content": f"Summarize:\n\n{text}"}]
         )
         return response.content[0].text
     """
@@ -112,7 +149,7 @@ def summarize(text: str, sentence_count: int = 5) -> str:
         elif SUMMARIZER_ENGINE == "llm_api":
             return _summarize_llm_api(text, sentence_count)
         else:
-            return _summarize_sumy(text, sentence_count)
+            return _summarize_simple(text, sentence_count)
     except Exception:
         # Safe fallback: first few sentences
         sentences = text.split(". ")
