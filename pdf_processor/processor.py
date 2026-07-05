@@ -45,8 +45,14 @@ def detect_chapters(pages: list[str]) -> list[dict]:
     """
     Detect probable chapter/heading boundaries across the document.
     Returns a list of {title, page_start} dicts. Falls back to a single
-    'Full Document' chapter if nothing is detected.
+    'Full Document' chapter if nothing is detected, or if the document is
+    too short for chapter splitting to make sense (e.g. a 1-2 page CV,
+    where ALL-CAPS section headers like "EDUCATION" would otherwise be
+    mistaken for chapter breaks).
     """
+    if len(pages) < 3:
+        return [{"title": "Full Document", "page_start": 1}]
+
     chapters = []
     for page_num, raw_text in enumerate(pages, start=1):
         for match in HEADING_PATTERN.finditer(raw_text):
@@ -132,10 +138,35 @@ def chapters_from_json(chapters_json: str) -> list[dict]:
         return []
 
 
+def _looks_like_toc_or_cover(text: str) -> bool:
+    """
+    Heuristic check for table-of-contents or cover/title pages: short lines,
+    many of which look like headings themselves, with little actual prose.
+    These pages produce poor audio if converted as their own "chapter" and
+    are better skipped or merged into the surrounding content.
+    """
+    if not text:
+        return True
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if not lines:
+        return True
+    words = text.split()
+    if len(words) < 30:
+        return True
+    avg_line_len = sum(len(l.split()) for l in lines) / len(lines)
+    if avg_line_len < 4:  # lots of short, heading-like lines = likely TOC/cover
+        return True
+    if re.search(r"table\s+of\s+contents", text, re.IGNORECASE):
+        return True
+    return False
+
+
 def split_text_by_chapters(pages: list[str], chapters: list[dict]) -> list[dict]:
     """
     Given page texts and detected chapter start pages, split full cleaned text
-    into per-chapter text blocks. Returns [{title, text}].
+    into per-chapter text blocks. Returns [{title, text}]. Chapters whose
+    content is too short, or that look like a cover/table-of-contents page,
+    are filtered out rather than sent to text-to-speech as their own chunk.
     """
     if len(chapters) <= 1:
         return [{"title": chapters[0]["title"] if chapters else "Full Document",
@@ -147,5 +178,20 @@ def split_text_by_chapters(pages: list[str], chapters: list[dict]) -> list[dict]
         start_page = ch["page_start"] - 1
         end_page = sorted_chapters[i + 1]["page_start"] - 1 if i + 1 < len(sorted_chapters) else len(pages)
         chunk_pages = pages[start_page:end_page]
-        result.append({"title": ch["title"], "text": get_full_text(chunk_pages)})
+        chunk_text = get_full_text(chunk_pages)
+
+        if len(chunk_text.split()) < 30:
+            continue  # too short to be meaningful narrated content
+        if _looks_like_toc_or_cover(chunk_text):
+            continue  # cover page / table of contents, skip
+
+        # Use a clean, single-line title even if the detected heading
+        # spanned multiple lines (e.g. a crowded TOC-adjacent match)
+        clean_title = ch["title"].split("\n")[0].strip()
+        result.append({"title": clean_title, "text": chunk_text})
+
+    # If filtering removed everything, fall back to the whole document
+    if not result:
+        result = [{"title": "Full Document", "text": get_full_text(pages)}]
+
     return result
